@@ -1,0 +1,1688 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+**Install all necessary packages**
+
+```{r}
+library(readr)
+library(dplyr)
+library(forecast)
+library(tseries)
+library(ggplot2)
+```
+
+**Load the provided Datasets**
+
+```{r}
+#Load datasets:
+
+# Set the working directory to the location of your CSV files
+setwd("C:/Users/Nikita Bhilare/OneDrive/Desktop/Imperial/Semester2/Logistics & Supply Chain/data/data")
+
+# Load each CSV file into a separate data frame
+pos_ordersale <- read_csv("pos_ordersale.csv")
+menuitem <- read_csv("menuitem.csv")
+store_restaurant <- read_csv("store_restaurant.csv")
+menu_items <- read_csv("menu_items.csv")
+recipes <- read_csv("recipes.csv")
+recipes_ingredient_assignments <- read_csv("recipe_ingredient_assignments.csv")
+recipe_sub_recipe_assignments <- read_csv("recipe_sub_recipe_assignments.csv")
+sub_recipes <- read_csv("sub_recipes.csv")
+sub_recipe_ingr_assignments <- read_csv("sub_recipe_ingr_assignments.csv")
+ingredients <- read_csv("ingredients.csv")
+portion_uom_types <- read_csv("portion_uom_types.csv")
+```
+
+**Ingredient Identifications:** Focusing on retrieving rows from Recipes and SubRecipes for the ingrediants - 'Lettuce' and 'Lettuce - Metric', as we aim to deal with predicting the lettuce quantities for the entire process of our forecasting. The ingredient ids for the following are: 27 and 291 respectively. The newly created dataframe is then integrated with the recipes table and the SubRecipes tables seperately two create two new seperate dataframes.
+
+```{r}
+# Step 1: Filter ingredients for lettuce
+lettuce_df <- ingredients %>%
+  filter(IngredientId %in% c(27, 291))
+
+# Step 2: Join with recipes_ingredient_assignments
+recipe_data <- inner_join(lettuce_df, recipes_ingredient_assignments, by = "IngredientId")
+
+# Step 3: Join with recipies
+recipe_data <- inner_join(recipe_data, recipes, by = "RecipeId")
+
+
+# Step 4: Join with sub_recipe_ingr_assignments
+subrecipe_data <- inner_join(lettuce_df, sub_recipe_ingr_assignments, by = "IngredientId")
+
+# Step 5: Join with sub_recipes
+subrecipe_data <- inner_join(subrecipe_data, sub_recipes, by = "SubRecipeId")
+
+subrecipe_data <- subrecipe_data %>%
+  rename(SubRecipe_ingr_quantity = Quantity)
+
+# Step 6: Join recipes_data with subrecipes_data via recipe_sub_recipe_assignments
+new_df <- inner_join(subrecipe_data, recipe_sub_recipe_assignments, by = "SubRecipeId")
+
+#Step 7: Combine all rows for recipes and subrecipes dataframes
+lettuce_usage <- bind_rows(recipe_data, new_df)
+```
+
+**Integration:** Here we integrate all tables which include the sales, stores, and menu information. Furthermore, we integrate it with our lettuce_usage table that we created.
+
+```{r}
+store_restaurant <- store_restaurant %>%
+  rename(StoreNumber = STORE_NUMBER)
+
+sales_df <- inner_join(store_restaurant, pos_ordersale, by = "StoreNumber")
+sales_df <- inner_join(sales_df, menuitem, by = c("MD5KEY_ORDERSALE", "date", "StoreNumber"))
+
+sales_df <- sales_df %>%
+  rename(purchase_quantity = Quantity)
+
+sales_df <- sales_df %>%
+  rename(MenuItemId = Id)
+
+sales_df <- inner_join(sales_df, menu_items, by = c("MenuItemId", "PLU"))
+
+final <- inner_join(sales_df, lettuce_usage, by = "RecipeId")
+
+```
+
+**Column Selection:** Almost all columns are present in the dataframe. Not all of them will be needed in the analysis later. Hence, to optimize our processes, Choosing columns which are necessary and storing them in our final dataset called predict_df is essential.
+
+```{r}
+desired_column_order <- c(
+  "MD5KEY_ORDERSALE", "date", "StoreNumber", "STORE_STATE", "MenuItemId", "purchase_quantity", 
+  "IngredientId", "IngredientName", "RecipeId", "Quantity", 
+  "SubRecipeId", "SubRecipe_ingr_quantity", "Factor"
+)
+
+# Rearrange the columns in the joined_data dataframe
+predict_df <- final %>%
+  select(desired_column_order)
+
+
+# Assuming 'predict_df' is your data frame
+predict_df <- predict_df %>%
+  mutate(
+    recipe_ingr_quantity = replace(Quantity, is.na(Quantity), 0),
+    SubRecipe_ingr_quantity = replace(SubRecipe_ingr_quantity, is.na(SubRecipe_ingr_quantity), 0), Factor = replace(Factor, is.na(Factor), 0)
+  )
+```
+
+**Lettuce Calculation per store per day:** we are calculating the lettuce used for each date, for each store.
+
+```{r}
+# Assuming 'predict_df' is your data frame
+total_lettuce_per_recipe <- predict_df %>%
+  group_by(date, StoreNumber, MenuItemId, MD5KEY_ORDERSALE) %>%
+  summarise(
+    Quantity = sum(purchase_quantity * 
+    ((SubRecipe_ingr_quantity * Factor) 
+     + recipe_ingr_quantity), 
+    na.rm = TRUE)
+  )
+
+# Assuming 'total_lettuce_per_recipe' is your data frame
+total_lettuce_per_transaction <- total_lettuce_per_recipe %>%
+  group_by(date, StoreNumber) %>%
+  summarise(
+    Total_Lettuce = sum(Quantity, na.rm = TRUE)
+  ) %>%
+  arrange(StoreNumber, date)
+head(total_lettuce_per_transaction)
+```
+
+**Saving the data processed in a new excel sheet.**
+
+```{r}
+library(openxlsx)
+
+# Assuming 'total_lettuce_per_transaction' is your data frame
+write.xlsx(total_lettuce_per_transaction, "total_lettuce_per_transaction.xlsx")
+```
+
+This step ensures that the 'date' column is treated as a Date object, making it easier to work with time series data.
+
+```{r}
+total_lettuce_per_transaction$date <- as.Date(total_lettuce_per_transaction$date, format="%y-%m-%d")
+```
+
+**Total lettuce across all stores**: we are making a chart for total lettuce used across all stores over the entire time frame. This helps us understand the trends in the lettuce usage quantities over the time period.
+
+```{r}
+library(zoo)
+# Aggregate lettuce usage for each date
+agg_data <- total_lettuce_per_transaction %>%
+  group_by(date) %>%
+  summarise(Total_Lettuce = sum(Total_Lettuce))
+
+# Create a zoo object
+lettuce_zoo <- zoo(agg_data$Total_Lettuce, as.Date(agg_data$date))
+
+# Plot the time series
+autoplot(lettuce_zoo) +
+  labs(title = "Total Lettuce Usage (All Stores)",
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+## [Store: 12631]{.underline}
+
+In this analysis, we focused on a specific store, identified by the store number 12631. For our targeted store, we filtered the data to isolate lettuce-related transactions, creating a time series object to capture the daily total lettuce usage. The time series plot visualizes the fluctuations in lettuce consumption over time, providing insights into potential patterns or trends.
+
+This approach allows us to gain a deeper understanding of the store's lettuce demand dynamics, a crucial factor for making informed inventory replenishment decisions.
+
+```{r}
+# Choose store number
+
+store_number <- 12631
+
+# Filter data for the chosen store
+store_data_12631 <- total_lettuce_per_transaction %>% filter(StoreNumber == store_number)
+
+# Create a zoo object
+store_series <- zoo(store_data_12631$Total_Lettuce, as.Date(store_data_12631$date))
+
+# Convert the 'date' column to Date format
+store_data_12631$date <- as.Date(store_data_12631$date)
+
+# Create a time series object
+store_series_ts <- ts(store_data_12631$Total_Lettuce, frequency = 7)
+
+# Plot the time series
+autoplot(store_series_ts) +
+  labs(title = paste("Total Lettuce Usage for Store", store_number),
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+We zoomed in on Store 12631, carefully dividing its lettuce usage data into two parts -- an 80% chunk for training our forecasting models and a 20% slice to validate their accuracy. This split, respecting the chronological order of our data, sets the stage for effective model training and evaluation.
+
+```{r}
+split_proportion <- 0.8
+
+# Function to split data for a specific store with window adjustment
+split_data <- function(store_data, split_proportion) {
+  split_index <- round(length(store_data) * split_proportion)
+  train_data <- window(store_data, end = time(store_data)[split_index])
+  test_data <- window(store_data, start = time(store_data)[split_index + 1])
+  return(list(train_data = train_data, test_data = test_data))
+}
+
+# Split data for each store with window adjustment
+split_12631 <- split_data(store_series_ts, split_proportion)
+
+# Training Set (80%)
+training_set_12631_ts <- split_12631$train_data
+
+# Validation Set (20%)
+validation_set_12631 <- split_12631$test_data
+```
+
+#### [Part 1) ARIMA Model:]{.underline}
+
+I performed stationarity tests using the Augmented Dickey-Fuller (ADF), Phillips-Perron (PP), and Kwiatkowski-Phillips-Schmidt-Shin (KPSS) tests. Additionally, ndiffs and nsdiffs functions are used to determine the number of non-seasonal and seasonal differences needed to make the time series stationary, respectively.
+
+```{r}
+#ARIMA identification and order determination
+adf.test(training_set_12631_ts)
+pp.test(training_set_12631_ts)
+kpss.test(training_set_12631_ts)
+
+# seasonal differencing
+ndiffs(training_set_12631_ts)
+nsdiffs(training_set_12631_ts)
+
+```
+
+**Key insights:**
+
+1)  The ADF test suggests that the time series is stationary with a confidence level of 0.05. The PP test also indicates stationarity.
+
+2)  The KPSS test suggests non-stationarity at level, complementing the ADF and PP tests.
+
+3)  One non-seasonal difference is needed for stationarity.
+
+In summary, based on these tests, the time series appears to be stationary after one non-seasonal difference.
+
+Hence, we carry out differencing and plot our resulted data:
+
+```{r}
+# ARIMA identification and order determination
+store_12631_ts_diff1 <- diff(training_set_12631_ts, differences = 1)
+autoplot(store_12631_ts_diff1)
+```
+
+**Key insight**: After differencing, data appears to be stationary now.
+
+Now we recheck the required results through the same tests again:
+
+```{r}
+#Now again check for all three tests
+adf.test(store_12631_ts_diff1)
+pp.test(store_12631_ts_diff1)
+kpss.test(store_12631_ts_diff1)
+
+# seasonal differencing
+ndiffs(store_12631_ts_diff1)  
+nsdiffs(store_12631_ts_diff1)
+```
+
+The differenced time series, obtained through seasonal differencing, exhibits strong evidence of stationarity based on Augmented Dickey-Fuller and Phillips-Perron tests, supporting its suitability for further modeling and forecasting.
+
+To further solidfy the selection of appropriate ARIMA parameters for our time series, we turn to the analysis of the autocorrelation function (ACF) and partial autocorrelation function (PACF). The visual examination of ACF and PACF plots aids in determining the optimal order for the ARIMA model, facilitating a more accurate and effective forecasting approach.
+
+**ACF Plot:**
+
+```{r}
+# Determine p and q
+ggAcf(store_12631_ts_diff1) +
+  labs(title = "ACF Plot for Total Lettuce Usage - Store 12631",
+       x = "Lag",
+       y = "Autocorrelation")
+```
+
+**PACF plot:**
+
+```{r}
+ggPacf(store_12631_ts_diff1) +
+  labs(title = "PACF Plot for Total Lettuce Usage - Store 12631",
+       x = "Lag",
+       y = "Partial Autocorrelation")
+```
+
+**Model Selection:**
+
+The auto.arima function was used to explore various combinations of differencing and seasonal parameters, considering the Akaike Information Criterion (AIC) as the selection criterion. Upon analysing the AIC values, three models with the lowest AICs were chosen. Subsequently, we proceeded to fit these selected models on our training data to further evaluate their forecasting capabilities.
+
+*(The code line for generating the auto arima models 'auto_arima_result_12631' is commented because of the long series of output. However, it stays uncommented in the RMD file)*
+
+```{r}
+# Automatic ARIMA model selection
+auto_arima_result_12631 <- auto.arima(training_set_12631_ts, D = 0, d = 1, 
+ic = 'aicc', trace = TRUE, stepwise = FALSE, approximation = FALSE)
+auto_arima_result_12631
+
+#Best Models selection:
+#ARIMA(0,1,1)(2,0,0)[7]: 836.1745
+#ARIMA(0,1,1)(1,0,0)[7]: 836.8194
+#ARIMA(0,1,1)(2,0,0)[7] with drift: 837.5495
+
+
+# Fit the ARIMA model
+arima_model_12631.m1 <- Arima(training_set_12631_ts, order = c(0, 1, 1),
+                              
+seasonal = list(order = c(2, 0, 0), period = 7), 
+include.drift = FALSE)
+
+arima_model_12631.m2 <- Arima(training_set_12631_ts, order = c(0, 1, 1), 
+                              
+seasonal = list(order = c(1, 0, 0), period = 7), 
+include.drift = FALSE)
+
+arima_model_12631.m3 <- Arima(training_set_12631_ts, order = c(0, 1, 1), 
+                              
+seasonal = list(order = c(2, 0, 0), period = 7), 
+include.drift = TRUE)
+```
+
+**Residuals analysis:**
+
+To make sure that the models we selected effectively represent the temporal trends, we used residual analysis. For residuals, R's checkresiduals() function offers an extensive collection of statistical tests and diagnostic charts. In order to confirm the accuracy of our projections and to make appropriate judgments, this phase is essential.
+
+```{r}
+# Residual analysis
+checkresiduals(arima_model_12631.m1)
+checkresiduals(arima_model_12631.m2)
+checkresiduals(arima_model_12631.m3)
+```
+
+**Forecasting and Accuracy:**
+
+Considering the fitted ARIMA models, we produce forecasts for the validation set in this stage. The validation set is a certain fraction of our time series data that was not used for model training. The 'accuracy' function, which offers a comprehensive set of parameters to evaluate the model's performance against the real data, is then used to determine how accurate these forecasts are. This analysis helps determine which ARIMA model is most likely to accurately estimate lettuce demand at Store 12631.
+
+```{r}
+# Forecast using the fitted model
+arima_forecast_12631.m1 <- forecast(arima_model_12631.m1, h = length(validation_set_12631))
+arima_forecast_12631.m2 <- forecast(arima_model_12631.m2, h = length(validation_set_12631))
+arima_forecast_12631.m3 <- forecast(arima_model_12631.m3, h = length(validation_set_12631))
+
+
+# Model evaluation
+accuracy(arima_forecast_12631.m1, validation_set_12631)
+accuracy(arima_forecast_12631.m2, validation_set_12631)
+accuracy(arima_forecast_12631.m3, validation_set_12631)
+```
+
+**Key Insights**:
+
+1)  With the lowest RMSE on the test sets, Model 1 performs better than the others according to the evaluation metrics, indicating that it is capable of forecasting lettuce demand at Store 12631 with greater accuracy.
+
+2)  Comparing this to models m2 and m3, a smaller RMSE demonstrates better performance in minimizing the prediction error.
+
+3)  The smaller RMSE values indicate that Model 1's forecasts align more closely with the actual values, making it the preferred choice for lettuce demand prediction in this context.
+
+**Fitting the best ARIMA Model on the entire data set:**
+
+The selected ARIMA(0,1,1)(2,0,0)[7] model, which has been determined to be the best-performing model on the training and validation sets, is being fitted to the whole dataset for Store 12631 in this stage of development. Establishing a definitive forecast for the subsequent 14 days is the ultimate objective.
+
+```{r}
+#now fit the first best model on our entire dataset
+arima_model_12631_final <- Arima(store_series_ts, order = c(0, 1, 1), 
+seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+
+# Final forecast
+final_forecast_12631 <- forecast(arima_model_12631_final, h = 14)
+
+# Extract point forecasts
+forecast_values <- final_forecast_12631$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data <- data.frame(date = forecast_dates, forecast = forecast_values)
+
+# Print the final forecast data
+print(final_forecast_data)
+```
+
+**Part 1 Conclusion**:
+
+In summary, the model has been validated on historical data, and its accuracy assessed through metrics such as RMSE. We built a forecast for the next 14 days using this ARIMA model, which offers insightful information for inventory management.
+
+#### [Part 2) Holt Winters Model:]{.underline}
+
+Moving forward, we will extend our analysis by investigating the Holt-Winters model in order to determine the best method of forecasting the demand for lettuce in our dataset.
+
+**Seasonal Decomposition:**
+
+Decomposing a time series facilitates the process of recognizing and illustrating the underlying patterns in the data, including the general trend and recurring seasonal patterns. Determining the total variability in the time series is made easier by having a clear understanding of each component's contribution.
+
+```{r}
+plot(stl(store_series_ts, s.window = "period"), main="Seasonal Decomposition of Time Series: Store 12631", xaxt = "n")
+
+```
+
+**Key Insights:**
+
+1)  The seasonal variations in the seasonal component plot get higher as the series continues on.
+
+2)  The fluctuations in the remainder/residual component plot appear to amplify with time, indicating that the irregular variations are also growing in size, which is inconsistent with constant variance.
+
+3)  The trend component seems to be comparatively flat or steady, suggesting that there is no clear trend and that it can be disregarded.
+
+In summary, the increasing amplitude of both seasonal and irregular components over time, combined with the lack of a prominent trend, strongly indicates the need for a multiplicative model formulation.
+
+**Model selection:**
+
+I performed ETS (Exponential Smoothing State Space) forecasting using the training set for Store 12631. First, I used the ets() function without specifying a model (store_12631_ets_training2) to identify the best ETS model for the given data. I got (M,N,M) model as the best model in this case. I then used this model (store_12631_ets_training) on the training dataset for further analysis.
+
+```{r}
+# ETS forecast based on the training set
+store_12631_ets_training2 <- ets(training_set_12631_ts) 
+
+#(M,N,M) is our best ETS model.
+# ETS MNM forecast based on the training set
+store_12631_ets_training <- ets(training_set_12631_ts, model ='MNM') 
+store_12631_ets_training
+```
+
+**In-sample estimation error:**
+
+Here we are evaluating the in-sample estimation error of the ETS (Error, Trend, Seasonal) model using the accuracy() function, which provides metrics like Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and others.
+
+```{r}
+# In-sample estimation error for ETS
+in_sample_errors_ets <- accuracy(store_12631_ets_training)
+in_sample_errors_ets
+
+```
+
+In conclusion, these metrics provide insights into the performance of the ETS model on the training data.
+
+**Out-of-sample evaluation:**
+
+I am using the trained ETS model (store_12631_ets_training) to generate forecasts for the length of the validation set. Furthermore, I evaluate the accuracy of the ETS model's forecasts against the actual values in the validation set. This helps in understanding how well the ETS model performs on unseen data by comparing its forecasts with the actual values in the validation set, using a range of accuracy metrics.
+
+```{r}
+#Out-of-sample evaluation for ETS
+store_12631_ets_forecast <- forecast.ets(store_12631_ets_training, h = length(validation_set_12631))
+store_12631_ets_forecast
+
+# Forecasting erros - ETS MODEL
+out_of_sample_errors_ets <- accuracy(store_12631_ets_forecast, 
+                                     validation_set_12631)
+out_of_sample_errors_ets
+```
+
+**Building the MNM model on the entire data set:**
+
+The trained model is now employed to forecast the future values for the entire time series (store_series_ts). The model is trained on the entire dataset, and then we generate a forecast for the next 14 time points (h = 14).
+
+```{r}
+# ETS MNM forecast on the entire dataset
+final_ets_model <- ets(store_series_ts, model ='MNM') 
+final_ets_forecast <- forecast.ets(final_ets_model, h = 14)
+
+# Extract point forecasts
+forecast_values_ets <- final_ets_forecast$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_ets <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_ets <- data.frame(date = forecast_dates_ets, forecast = forecast_values_ets)
+
+# Print the final forecast data
+print(final_forecast_data_ets)
+
+
+```
+
+**Part 2 Conclusion:**
+
+The resulting 'final_forecast_data_ets' contains the forecasted values and allows me to project future trends and seasonality based on the characteristics learned from the historical data.
+
+#### [**Part 3 Comparison:**]{.underline}
+
+Now, that we have both the Arima and the Holt winters model setup, we need to assess the forecasting performance of both the ARIMA and Holt-Winters models for a two-week timeframe.
+
+To gain insights into the accuracy of each model's predictions, we initiated the examination by visualizing the forecasted values individually for ARIMA and Holt-Winters. This step allows us to observe the pattern and behavior of the forecasted series generated by each model.
+
+**A) Plot the forecasts of the ARIMA Model:**
+
+```{r}
+# Plot the forecast
+autoplot(final_forecast_12631) +
+  labs(title = "ARIMA Forecast for Total Lettuce Usage - Store 12631",
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+**B) Plot the forecasts of the Holt Winter Model:**
+
+```{r}
+# Plot the final forecast
+plot(final_ets_forecast, main = "Final Forecast from ETS on Entire Dataset", xlab="Time Horizon", ylab="Lettuce quantity (ounces)", lty = 1, col = "black", frame.plot = FALSE)
+```
+
+**C) ARIMA vs HoltWinters Model Forecasts:**
+
+```{r}
+# Plot actual data
+autoplot(store_series_ts) +
+  labs(title = "Actual vs. Forecast Comparison",
+       x = "Date",
+       y = "Total Lettuce Usage") +
+  autolayer(final_forecast_12631$mean, series = "ARIMA Forecast") +
+  autolayer(final_ets_forecast$mean, series = "Holt-Winters Forecast") +
+  guides(color = guide_legend(title = "Forecasts"))
+
+```
+
+**Analysis of the Accuracies of both the Models:**
+
+Following the visual analysis of the ARIMA and Holt-Winters forecasts, we proceeded to a quantitative assessment using the Root Mean Squared Error (RMSE). RMSE is a widely utilized metric for evaluating the accuracy of forecasting models, providing a comprehensive measure of the differences between predicted and observed values. By calculating the RMSE for both the ARIMA and Holt-Winters models, we aim to quantify the level of accuracy each model achieves in capturing the actual values. A lower RMSE signifies better predictive performance, indicating that the model's forecasts closely align with the observed data. This numerical comparison aids in selecting the model that exhibits superior accuracy and reliability in forecasting the daily demand for lettuce in our dataset over the specified two-week period.
+
+```{r}
+#RMSE of Arima Model
+accuracy(arima_forecast_12631.m1, validation_set_12631)
+
+#RMSE of ETS Model
+out_of_sample_errors_ets
+
+```
+
+**Key Insights:**
+
++---------------+--------------+--------------+
+| RMSE Values   | ARIMA        | Holt Winters |
++===============+==============+==============+
+| Training data | ```          | ```          |
+|               | 39.11431     | 35.05182     |
+|               | ```          | ```          |
++---------------+--------------+--------------+
+| Test data     | ```          | ```          |
+|               | 47.92302     | 43.66539     |
+|               | ```          | ```          |
++---------------+--------------+--------------+
+
+ETS model, the MNM Model, has lower RMSE values for both the training and test sets compared to the ARIMA model. This suggests that the ETS model provides a better fit to the data in terms of forecasting accuracy. The lower RMSE values indicate that the ETS model's predictions are closer to the actual values, both in the training and test phases.
+
+In summary, based on the RMSE values, the ETS model outperforms the ARIMA model in this specific analysis.
+
+**Final Forecasted Values:**
+
+Hence, the final predictions for the Store 12631 using the ETS - MNM model are:
+
+```{r}
+# Print the final forecast data
+print(final_forecast_data_ets)
+```
+
+## [Store: 46673]{.underline}
+
+In this analysis, we focused on a specific store, identified by the store number 46673. For our targeted store, we filtered the data to isolate lettuce-related transactions, creating a time series object to capture the daily total lettuce usage. The time series plot visualizes the fluctuations in lettuce consumption over time, providing insights into potential patterns or trends.
+
+This approach allows us to gain a deeper understanding of the store's lettuce demand dynamics, a crucial factor for making informed inventory replenishment decisions.
+
+```{r}
+# Choose store number
+store_number <- 46673
+
+# Filter data for the chosen store
+store_data_46673 <- total_lettuce_per_transaction %>% filter(StoreNumber == store_number)
+
+# Create a zoo object
+store_series <- zoo(store_data_46673$Total_Lettuce, as.Date(store_data_46673$date))
+
+# Create a time series object
+store_series_ts <- ts(store_data_46673$Total_Lettuce, frequency = 7)
+
+# Plot the time series
+autoplot(store_series_ts) +
+  labs(title = paste("Total Lettuce Usage for Store", store_number),
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+We zoomed in on Store 46673, carefully dividing its lettuce usage data into two parts -- an 80% chunk for training our forecasting models and a 20% slice to validate their accuracy. This split, respecting the chronological order of our data, sets the stage for effective model training and evaluation.
+
+```{r}
+split_proportion <- 0.8
+
+# Function to split data for a specific store with window adjustment
+split_data <- function(store_data, split_proportion) {
+  split_index <- round(length(store_data) * split_proportion)
+  train_data <- window(store_data, end = time(store_data)[split_index])
+  test_data <- window(store_data, start = time(store_data)[split_index + 1])
+  return(list(train_data = train_data, test_data = test_data))
+}
+
+# Split data for each store with window adjustment
+split_46673 <- split_data(store_series_ts, split_proportion)
+
+# Training Set (80%)
+training_set_46673_ts <- split_46673$train_data
+# Validation Set (20%)
+validation_set_46673 <- split_46673$test_data
+```
+
+#### [**Part 1) ARIMA Model:**]{.underline}
+
+I performed stationarity tests using the Augmented Dickey-Fuller (ADF), Phillips-Perron (PP), and Kwiatkowski-Phillips-Schmidt-Shin (KPSS) tests. Additionally, ndiffs and nsdiffs functions are used to determine the number of non-seasonal and seasonal differences needed to make the time series stationary, respectively.
+
+```{r}
+# ARIMA identification and order determination
+adf.test(training_set_46673_ts)
+pp.test(training_set_46673_ts)
+kpss.test(training_set_46673_ts)
+
+# seasonal differencing
+ndiffs(training_set_46673_ts)  
+nsdiffs(training_set_46673_ts)
+```
+
+**Key insights:**
+
+1.  The ADF test suggests that the time series is stationary with a confidence level of 0.05. The PP test also indicates stationarity.
+2.  One non-seasonal difference is needed for stationarity.
+
+In summary, based on these tests, the time series appears to be stationary after one non-seasonal difference. Hence, we carry out differencing and plot our resulted data:
+
+```{r}
+# ARIMA identification and order determination
+store_46673_ts_diff1 <- diff(training_set_46673_ts, differences = 1, lag=7)
+autoplot(store_46673_ts_diff1)
+```
+
+**Key insight**: After differencing, data appears to be stationary now.
+
+Now we recheck the required results through the same tests again:
+
+```{r}
+# ARIMA identification and order determination
+adf.test(store_46673_ts_diff1)
+pp.test(store_46673_ts_diff1)
+kpss.test(store_46673_ts_diff1)
+
+# seasonal differencing
+ndiffs(store_46673_ts_diff1)  
+nsdiffs(store_46673_ts_diff1)
+```
+
+The differenced time series, obtained through seasonal differencing, exhibits strong evidence of stationarity based on Augmented Dickey-Fuller and Phillips-Perron tests, supporting its suitability for further modeling and forecasting.
+
+To further solidfy the selection of appropriate ARIMA parameters for our time series, we turn to the analysis of the autocorrelation function (ACF) and partial autocorrelation function (PACF). The visual examination of ACF and PACF plots aids in determining the optimal order for the ARIMA model, facilitating a more accurate and effective forecasting approach.
+
+**ACF Plot:**
+
+```{r}
+# Determine p and q
+ggAcf(store_46673_ts_diff1) +
+  labs(title = "ACF Plot for Total Lettuce Usage - Store 46673",
+       x = "Lag",
+       y = "Autocorrelation")
+```
+
+**PACF Plot:**
+
+```{r}
+ggPacf(store_46673_ts_diff1) +
+  labs(title = "PACF Plot for Total Lettuce Usage - Store 46673",
+       x = "Lag",
+       y = "Partial Autocorrelation")
+```
+
+**Model Selection:**
+
+The auto.arima function was used to explore various combinations of differencing and seasonal parameters, considering the Akaike Information Criterion (AIC) as the selection criterion. Upon analysing the AIC values, three models with the lowest AICs were chosen. Subsequently, we proceeded to fit these selected models on our training data to further evaluate their forecasting capabilities.
+
+*(The code line for generating the auto arima models 'auto_arima_result_46673' is commented because of the long series of output. However, it stays uncommented in the RMD file)*
+
+```{r}
+# Automatic ARIMA model selection
+auto_arima_result_46673 <- auto.arima(training_set_46673_ts, ic = 'aicc', D = 1, d = 0, approximation = FALSE, stepwise = FALSE,  trace = TRUE)
+
+auto_arima_result_46673
+
+#best models:
+#ARIMA(1,0,0)(0,1,1)[7]: 713.1908
+#ARIMA(0,0,1)(0,1,1)[7]: 713.2317
+#ARIMA(0,0,0)(0,1,1)[7]: 713.2449
+
+
+
+# Fit the ARIMA model
+arima_model_46673.m1 <- Arima(training_set_46673_ts, order = c(1, 0, 0), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+arima_model_46673.m2 <- Arima(training_set_46673_ts, order = c(0, 0, 1), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+arima_model_46673.m3 <- Arima(training_set_46673_ts, order = c(0, 0, 0), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+```
+
+**Residuals analysis:**
+
+To make sure that the models we selected effectively represent the temporal trends, we used residual analysis. For residuals, R's checkresiduals() function offers an extensive collection of statistical tests and diagnostic charts. In order to confirm the accuracy of our projections and to make appropriate judgments, this phase is essential.
+
+```{r}
+# Residual analysis
+checkresiduals(arima_model_46673.m1)
+checkresiduals(arima_model_46673.m2)
+checkresiduals(arima_model_46673.m3)
+```
+
+**Forecasting and Accuracy:**
+
+Considering the fitted ARIMA models, we produce forecasts for the validation set in this stage. The validation set is a certain fraction of our time series data that was not used for model training. The 'accuracy' function, which offers a comprehensive set of parameters to evaluate the model's performance against the real data, is then used to determine how accurate these forecasts are. This analysis helps determine which ARIMA model is most likely to accurately estimate lettuce demand at Store 46673.
+
+```{r}
+# Forecast using the fitted model
+arima_forecast_46673.m1 <- forecast(arima_model_46673.m1, h = length(validation_set_46673))
+arima_forecast_46673.m2 <- forecast(arima_model_46673.m2, h = length(validation_set_46673))
+arima_forecast_46673.m3 <- forecast(arima_model_46673.m3, h = length(validation_set_46673))
+
+
+
+# Model evaluation
+accuracy(arima_forecast_46673.m1, validation_set_46673)
+accuracy(arima_forecast_46673.m2, validation_set_46673)
+accuracy(arima_forecast_46673.m3, validation_set_46673)
+#best rmse value is for arima_forecast_46673.m1 model
+```
+
+**Key Insights**:
+
+1.  With the lowest RMSE on the test sets, Model 1 performs better than the others according to the evaluation metrics, indicating that it is capable of forecasting lettuce demand at Store 46673 with greater accuracy.
+2.  Comparing this to models m2 and m3, a smaller RMSE demonstrates better performance in minimizing the prediction error.
+3.  The smaller RMSE values indicate that Model 1's forecasts align more closely with the actual values, making it the preferred choice for lettuce demand prediction in this context.
+
+**Fitting the best ARIMA Model on the entire data set:**
+
+The selected ARIMA(1,0,0)(0,1,1)[7] model, which has been determined to be the best-performing model on the training and validation sets, is being fitted to the whole dataset for Store 46673 in this stage of development. Establishing a definitive forecast for the subsequent 14 days is the ultimate objective.
+
+```{r}
+#now fit the first best model on our entire dataset
+arima_model_46673_final <- Arima(store_series_ts, order = c(1, 0, 0), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+
+# Final forecast
+final_forecast_46673 <- forecast(arima_model_46673_final, h = 14)
+
+final_forecast_46673
+
+# Extract point forecasts
+forecast_values_46673 <- final_forecast_46673$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_46673 <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_46673 <- data.frame(date = forecast_dates_46673, 
+forecast = forecast_values_46673)
+
+# Print the final forecast data
+print(final_forecast_data_46673)
+```
+
+**Part 1 Conclusion**:
+
+In summary, the model has been validated on historical data, and its accuracy assessed through metrics such as RMSE. We built a forecast for the next 14 days using this ARIMA model, which offers insightful information for inventory management.
+
+#### [Part 2) Holt Winters Model:]{.underline}
+
+Moving forward, we will extend our analysis by investigating the Holt-Winters model in order to determine the best method of forecasting the demand for lettuce in our dataset.
+
+**Seasonal Decomposition:**
+
+Decomposing a time series facilitates the process of recognizing and illustrating the underlying patterns in the data, including the general trend and recurring seasonal patterns. Determining the total variability in the time series is made easier by having a clear understanding of each component's contribution.
+
+```{r}
+plot(stl(store_series_ts, s.window = "period"), 
+main="Seasonal Decomposition of Time Series: Store 46673", xaxt = "n")
+
+```
+
+**Key Insights:**
+
+1)  The trend component of the time-series can be disregarded because no particular, significant linear trend can be seen, according to the seasonal decomposition of the data. 
+
+2)  Furthermore, it appears that the time series has an additive seasonal component, which will be required by the future forecast model to be developed in order to match the time series and provide future projections.
+
+**Model selection:**
+
+I performed ETS (Exponential Smoothing State Space) forecasting using the training set for Store 46673. First, I used the ets() function without specifying a model (store_46673_ets_training2) to identify the best ETS model for the given data. I got (A,N,A) model as the best model in this case. I then used this model (store_46673_ets_training) on the training dataset for further analysis.
+
+```{r}
+# ETS forecast based on the training set
+store_46673_ets_training2 <- ets(training_set_46673_ts, model='ZZZ') 
+
+#ETS(A,N,A) is our best ETS model.
+# ETS ANA forecast based on the training set
+store_46673_ets_training <- ets(training_set_46673_ts, model='ANA') 
+store_46673_ets_training
+```
+
+**In-sample estimation error:**
+
+Here we are evaluating the in-sample estimation error of the ETS (Error, Trend, Seasonal) model using the accuracy() function, which provides metrics like Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and others.
+
+```{r}
+# In-sample estimation error for ETS
+in_sample_errors_ets <- accuracy(store_46673_ets_training)
+in_sample_errors_ets
+```
+
+In conclusion, these metrics provide insights into the performance of the ETS model on the training data.
+
+**Out-of-sample evaluation:**
+
+I am using the trained ETS model (store_46673_ets_training) to generate forecasts for the length of the validation set. Furthermore, I evaluate the accuracy of the ETS model's forecasts against the actual values in the validation set. This helps in understanding how well the ETS model performs on unseen data by comparing its forecasts with the actual values in the validation set, using a range of accuracy metrics.
+
+```{r}
+#Out-of-sample evaluation for ETS
+store_46673_ets_forecast <- forecast.ets(store_46673_ets_training, h = length(validation_set_46673))
+store_46673_ets_forecast
+
+# Forecasting erros - ETS MODEL
+out_of_sample_errors_ets <- accuracy(store_46673_ets_forecast, validation_set_46673)
+out_of_sample_errors_ets
+```
+
+**Building the ANA model on the entire data set:**
+
+The trained model is now employed to forecast the future values for the entire time series (store_series_ts). The model is trained on the entire dataset, and then we generate a forecast for the next 14 time points (h = 14).
+
+```{r}
+# ETS ANA forecast on the entire dataset
+final_ets_model <- ets(store_series_ts, model='ANA') 
+final_ets_forecast <- forecast.ets(final_ets_model, h = 14)
+
+# Display the forecasted values
+final_ets_forecast
+
+# Extract point forecasts
+forecast_values_ets <- final_ets_forecast$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_ets <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_ets <- data.frame(date = forecast_dates_ets, forecast = forecast_values_ets)
+
+# Print the final forecast data
+print(final_forecast_data_ets)
+```
+
+**Part 2 Conclusion:**
+
+The resulting 'final_forecast_data_ets' contains the forecasted values and allows me to project future trends and seasonality based on the characteristics learned from the historical data.
+
+#### [**Part 3 Comparison:**]{.underline}
+
+Now, that we have both the Arima and the Holt winters model setup, we need to assess the forecasting performance of both the ARIMA and Holt-Winters models for a two-week timeframe.
+
+To gain insights into the accuracy of each model's predictions, we initiated the examination by visualizing the forecasted values individually for ARIMA and Holt-Winters. This step allows us to observe the pattern and behavior of the forecasted series generated by each model.
+
+**A) Plot the forecasts of the ARIMA Model:**
+
+```{r}
+# Plot the forecast
+autoplot(final_forecast_46673) +
+  labs(title = "ARIMA Forecast for Total Lettuce Usage - Store 46673",
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+**B) Plot the forecasts of the Holt Winter Model:**
+
+```{r}
+# Plot the final forecast
+plot(final_ets_forecast, main = "Final Forecast from ETS on Entire Dataset", xlab="Time Horizon", ylab="Lettuce quantity (ounces)", lty = 1, col = "black", frame.plot = FALSE)
+```
+
+**C) ARIMA vs HoltWinters Model Forecasts:**
+
+```{r}
+# Plot actual data
+autoplot(store_series_ts) +
+  labs(title = "Actual vs. Forecast Comparison",
+       x = "Date",
+       y = "Total Lettuce Usage") +
+  autolayer(final_forecast_46673$mean, series = "ARIMA Forecast") +
+  autolayer(final_ets_forecast$mean, series = "Holt-Winters Forecast") +
+  guides(color = guide_legend(title = "Forecasts"))
+```
+
+**Analysis of the Accuracies of both the Models:**
+
+Following the visual analysis of the ARIMA and Holt-Winters forecasts, we proceeded to a quantitative assessment using the Root Mean Squared Error (RMSE). RMSE is a widely utilized metric for evaluating the accuracy of forecasting models, providing a comprehensive measure of the differences between predicted and observed values. By calculating the RMSE for both the ARIMA and Holt-Winters models, we aim to quantify the level of accuracy each model achieves in capturing the actual values. A lower RMSE signifies better predictive performance, indicating that the model's forecasts closely align with the observed data. This numerical comparison aids in selecting the model that exhibits superior accuracy and reliability in forecasting the daily demand for lettuce in our dataset over the specified two-week period.
+
+```{r}
+#accuracy of arima
+accuracy(arima_forecast_46673.m1, validation_set_46673)
+
+#accuracy of HoltWinters
+out_of_sample_errors_ets
+
+#Preferred ARIMA
+```
+
++--------------+--------------+--------------+
+| RMSE Values  | ARIMA        | Holt Winters |
++==============+==============+==============+
+| training set | ```          | ```          |
+|              | 24.95910     | 23.22218     |
+|              | ```          | ```          |
++--------------+--------------+--------------+
+| test set     | ```          | ```          |
+|              | 38.00071     | 38.16146     |
+|              | ```          | ```          |
++--------------+--------------+--------------+
+
+**Key Insights:**
+
+1)  The ANA model exhibits a lower RMSE on the training set, indicating that it fits the historical data more closely.
+
+2)  The ARIMA model performs better on the test set as it has a lower RMSE. This suggests that the ARIMA model's forecasting accuracy is better when applied to unseen data.
+
+3)  The visual inspection of forecasted values from both models reveals similar patterns. This observation aligns with the notion that, in some cases, different models may produce comparable forecasts even if their underlying structures are different.
+
+To further analyse a better model, I calculated the AIC values of the models on which the ARIMA and Holtwinters were applied.
+
+```{r}
+#ANA Model
+AIC(store_46673_ets_training)
+
+#ARIMA Model
+AIC(arima_model_46673.m1)
+
+```
+
+The AIC values provide a quantitative measure of model fit, considering both the goodness of fit and model complexity. A lower AIC indicates a better-fitting model.
+
+In this case, the ARIMA model has a lower AIC (712.8527) compared to the ANA model (897.1487), reinforcing the notion that the ARIMA model is preferred in terms of AIC.
+
+While the ANA model shows better performance on the training set, the ARIMA model outperforms on the test set and has a lower AIC. The decision between the two models should consider both training and test set performance, and in this case, the ARIMA model appears to be more suitable for forecasting.
+
+**Final Forecasted Values:**
+
+Hence, the final predictions for the Store 46673 using the ARIMA model are:
+
+```{r}
+# Print the final forecast data
+print(final_forecast_data_46673)
+```
+
+## [Store: 20974]{.underline}
+
+In this analysis, we focused on a specific store, identified by the store number 20974. For our targeted store, we filtered the data to isolate lettuce-related transactions, creating a time series object to capture the daily total lettuce usage. The time series plot visualizes the fluctuations in lettuce consumption over time, providing insights into potential patterns or trends.
+
+This approach allows us to gain a deeper understanding of the store's lettuce demand dynamics, a crucial factor for making informed inventory replenishment decisions.
+
+```{r}
+# Choose store number
+store_number <- 20974
+
+# Filter data for the chosen store
+store_data_20974 <- total_lettuce_per_transaction %>% filter(StoreNumber == store_number)
+
+# Create a zoo object
+store_series <- zoo(store_data_20974$Total_Lettuce, as.Date(store_data_20974$date))
+
+# Create a time series object
+store_series_ts <- ts(store_data_20974$Total_Lettuce, frequency = 7)
+
+# Plot the time series
+autoplot(store_series_ts) +
+  labs(title = paste("Total Lettuce Usage for Store", store_number),
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+We zoomed in on Store 20974, carefully dividing its lettuce usage data into two parts -- an 80% chunk for training our forecasting models and a 20% slice to validate their accuracy. This split, respecting the chronological order of our data, sets the stage for effective model training and evaluation.
+
+```{r}
+split_proportion <- 0.8
+
+# Function to split data for a specific store with window adjustment
+split_data <- function(store_data, split_proportion) {
+  split_index <- round(length(store_data) * split_proportion)
+  train_data <- window(store_data, end = time(store_data)[split_index])
+  test_data <- window(store_data, start = time(store_data)[split_index + 1])
+  return(list(train_data = train_data, test_data = test_data))
+}
+
+# Split data for each store with window adjustment
+split_20974 <- split_data(store_series_ts, split_proportion)
+
+# Training Set (80%)
+training_set_20974_ts <- split_20974$train_data
+
+# Validation Set (20%)
+validation_set_20974 <- split_20974$test_data
+```
+
+#### [**Part 1) ARIMA Model:**]{.underline}
+
+I performed stationarity tests using the Augmented Dickey-Fuller (ADF), Phillips-Perron (PP), and Kwiatkowski-Phillips-Schmidt-Shin (KPSS) tests. Additionally, ndiffs and nsdiffs functions are used to determine the number of non-seasonal and seasonal differences needed to make the time series stationary, respectively.
+
+```{r}
+# ARIMA identification and order determination
+adf.test(training_set_20974_ts)
+pp.test(training_set_20974_ts)
+kpss.test(training_set_20974_ts)
+
+# seasonal differencing
+ndiffs(training_set_20974_ts)  
+nsdiffs(training_set_20974_ts)
+```
+
+**Key insights:**
+
+1.  The ADF test suggests that the time series is stationary . The PP test also indicates stationarity as the p-value is below the significance level.
+2.  The KPSS test provides additional confirmation of stationarity, with a p-value below the significance level.
+3.  One non-seasonal difference is needed for stationarity.
+
+In summary, based on these tests, the time series appears to be stationary after one non-seasonal difference.
+
+Hence, we carry out differencing and plot our resulted data:
+
+```{r}
+# ARIMA identification and order determination
+store_20974_ts_diff1 <- diff(training_set_20974_ts, differences = 1)
+autoplot(store_20974_ts_diff1)
+```
+
+**Key insight**: After differencing, data appears to be stationary now.
+
+Now we recheck the required results through the same tests again:
+
+```{r}
+#Now again check for all three tests
+adf.test(store_20974_ts_diff1)
+pp.test(store_20974_ts_diff1)
+kpss.test(store_20974_ts_diff1)
+
+# seasonal differencing
+ndiffs(store_20974_ts_diff1)  
+nsdiffs(store_20974_ts_diff1)
+```
+
+The differenced time series, obtained through seasonal differencing, exhibits strong evidence of stationarity based on Augmented Dickey-Fuller and Phillips-Perron tests, supporting its suitability for further modeling and forecasting.
+
+To further solidfy the selection of appropriate ARIMA parameters for our time series, we turn to the analysis of the autocorrelation function (ACF) and partial autocorrelation function (PACF). The visual examination of ACF and PACF plots aids in determining the optimal order for the ARIMA model, facilitating a more accurate and effective forecasting approach.
+
+**ACF Plot:**
+
+```{r}
+# Determine p and q
+ggAcf(store_20974_ts_diff1) +
+  labs(title = "ACF Plot for Total Lettuce Usage - Store 20974",
+       x = "Lag",
+       y = "Autocorrelation")
+```
+
+**PACF plot:**
+
+```{r}
+ggPacf(store_20974_ts_diff1) +
+  labs(title = "PACF Plot for Total Lettuce Usage - Store 20974",
+       x = "Lag",
+       y = "Partial Autocorrelation")
+
+```
+
+**Model Selection:**
+
+The auto.arima function was used to explore various combinations of differencing and seasonal parameters, considering the Akaike Information Criterion (AIC) as the selection criterion. Upon analysing the AIC values, three models with the lowest AICs were chosen. Subsequently, we proceeded to fit these selected models on our training data to further evaluate their forecasting capabilities.
+
+*(The code line for generating the auto arima models 'auto_arima_result_20974' is commented because of the long series of output. However, it stays uncommented in the RMD file)*
+
+```{r}
+# Automatic ARIMA model selection
+auto_arima_result_20974 <- auto.arima(training_set_20974_ts, 
+D = 0, d = 1, ic = 'aicc', trace = TRUE, stepwise = FALSE, approximation = FALSE)
+
+auto_arima_result_20974
+
+#Best Models selection:
+#ARIMA(0,1,1)(1,0,0)[7]: 810.7419
+#ARIMA(0,1,1)(0,0,1)[7]: 811.4762
+#ARIMA(0,1,1)(1,0,0)[7] with drift: 812.01
+
+
+# Fit the ARIMA model
+arima_model_20974.m1 <- Arima(training_set_20974_ts, order = c(0, 1, 1), 
+seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+
+arima_model_20974.m2 <- Arima(training_set_20974_ts, order = c(0, 1, 1), 
+seasonal = list(order = c(0, 0, 1), period = 7), include.drift = FALSE)
+
+arima_model_20974.m3 <- Arima(training_set_20974_ts, order = c(0, 1, 1), 
+seasonal = list(order = c(1, 0, 0), period = 7), include.drift = TRUE)
+
+```
+
+**Residuals analysis:**
+
+To make sure that the models we selected effectively represent the temporal trends, we used residual analysis. For residuals, R's checkresiduals() function offers an extensive collection of statistical tests and diagnostic charts. In order to confirm the accuracy of our projections and to make appropriate judgments, this phase is essential.
+
+```{r}
+# Residual analysis
+checkresiduals(arima_model_20974.m1)
+checkresiduals(arima_model_20974.m2)
+checkresiduals(arima_model_20974.m3)
+```
+
+**Forecasting and Accuracy:**
+
+Considering the fitted ARIMA models, we produce forecasts for the validation set in this stage. The validation set is a certain fraction of our time series data that was not used for model training. The 'accuracy' function, which offers a comprehensive set of parameters to evaluate the model's performance against the real data, is then used to determine how accurate these forecasts are. This analysis helps determine which ARIMA model is most likely to accurately estimate lettuce demand at Store 20974.
+
+```{r}
+# Forecast using the fitted model
+arima_forecast_20974.m1 <- forecast(arima_model_20974.m1, h = length(validation_set_20974))
+arima_forecast_20974.m2 <- forecast(arima_model_20974.m2, h = length(validation_set_20974))
+arima_forecast_20974.m3 <- forecast(arima_model_20974.m3, h = length(validation_set_20974))
+
+
+# Model evaluation
+accuracy(arima_forecast_20974.m1, validation_set_20974)
+accuracy(arima_forecast_20974.m2, validation_set_20974)
+accuracy(arima_forecast_20974.m3, validation_set_20974)
+
+#best rmse value is for arima_forecast_20974.m1 model
+```
+
+**Key Insights**:
+
+1.  With the lowest RMSE on the test sets, Model 1 performs better than the others according to the evaluation metrics, indicating that it is capable of forecasting lettuce demand at Store 20974 with greater accuracy.
+2.  Comparing this to models m2 and m3, a smaller RMSE demonstrates better performance in minimizing the prediction error.
+3.  The smaller RMSE values indicate that Model 1's forecasts align more closely with the actual values, making it the preferred choice for lettuce demand prediction in this context.
+
+**Fitting the best ARIMA Model on the entire data set:**
+
+The selected ARIMA(0,1,1)(1,0,0)[7] model, which has been determined to be the best-performing model on the training and validation sets, is being fitted to the whole dataset for Store 20974 in this stage of development. Establishing a definitive forecast for the subsequent 14 days is the ultimate objective.
+
+```{r}
+
+#now fit the first best model on our entire dataset
+arima_model_20974_final <- Arima(store_series_ts, order = c(0, 1, 1), 
+seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+
+# Final forecast
+final_forecast_20974 <- forecast(arima_model_20974_final, h = 14)
+
+# Extract point forecasts
+forecast_values_20974 <- final_forecast_20974$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_20974 <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_20974 <- data.frame(date = forecast_dates_20974, forecast = forecast_values_20974)
+
+# Print the final forecast data
+print(final_forecast_data_20974)
+
+
+```
+
+**Part 1 Conclusion**:
+
+In summary, the model has been validated on historical data, and its accuracy assessed through metrics such as RMSE. We built a forecast for the next 14 days using this ARIMA model, which offers insightful information for inventory management.
+
+#### [Part 2) Holt Winters Model:]{.underline}
+
+Moving forward, we will extend our analysis by investigating the Holt-Winters model in order to determine the best method of forecasting the demand for lettuce in our dataset.
+
+**Seasonal Decomposition:**
+
+Decomposing a time series facilitates the process of recognizing and illustrating the underlying patterns in the data, including the general trend and recurring seasonal patterns. Determining the total variability in the time series is made easier by having a clear understanding of each component's contribution.
+
+```{r}
+plot(stl(store_series_ts, s.window = "period"), main="Seasonal Decomposition of Time Series: Store 20974", xaxt = "n")
+```
+
+Key Insights:
+
+1)  The trend shows initial increase in the beginning, but is more or less stable for quite some time later. There is no linear trend for sure.
+
+2)  An additive seasonal component seems to take place in the time-series and will be needed to the upcoming forecast model.
+
+**Model selection:**
+
+I performed ETS (Exponential Smoothing State Space) forecasting using the training set for Store 20974. First, I used the ets() function without specifying a model (store_20974_ets_training2) to identify the best ETS model for the given data. I got (A, A, N) model as the best model in this case. However, its very evident that data follows a non-linear trend. Hence, In the context of our model analysis, (A, N, A) proves to be the most accurate in this case. I then used this model (store_20974_ets_training) on the training dataset for further analysis.
+
+```{r}
+# ETS forecast based on the training set
+store_20974_ets_training2 <- ets(training_set_20974_ts, model='ZZZ') 
+
+store_20974_ets_training <- ets(training_set_20974_ts, model='ANA', ic = 'aicc') 
+store_20974_ets_training
+```
+
+**In-sample estimation error:**
+
+Here we are evaluating the in-sample estimation error of the ETS (Error, Trend, Seasonal) model using the accuracy() function, which provides metrics like Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and others.
+
+```{r}
+# In-sample estimation error for ETS
+in_sample_errors_ets <- accuracy(store_20974_ets_training)
+in_sample_errors_ets
+```
+
+In conclusion, these metrics provide insights into the performance of the ETS model on the training data.
+
+**Out-of-sample evaluation:**
+
+I am using the trained ETS model (store_20974_ets_training) to generate forecasts for the length of the validation set. Furthermore, I evaluate the accuracy of the ETS model's forecasts against the actual values in the validation set. This helps in understanding how well the ETS model performs on unseen data by comparing its forecasts with the actual values in the validation set, using a range of accuracy metrics.
+
+```{r}
+#Out-of-sample evaluation for ETS
+store_20974_ets_forecast <- forecast.ets(store_20974_ets_training, h = length(validation_set_20974))
+
+# Forecasting erros - ETS MODEL
+out_of_sample_errors_ets <- accuracy(store_20974_ets_forecast, validation_set_20974)
+out_of_sample_errors_ets
+```
+
+**Building the ANA model on the entire data set:**
+
+The trained model is now employed to forecast the future values for the entire time series (store_series_ts). The model is trained on the entire dataset, and then we generate a forecast for the next 14 time points (h = 14).
+
+```{r}
+final_ets_model <- ets(store_series_ts, model='ANA', ic = 'aicc') 
+final_ets_forecast <- forecast(final_ets_model, h = 14)
+
+# Extract point forecasts
+forecast_values_ets <- final_ets_forecast$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_ets <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_ets <- data.frame(date = forecast_dates_ets, forecast = forecast_values_ets)
+
+# Print the final forecast data
+print(final_forecast_data_ets)
+
+```
+
+**Part 2 Conclusion:**
+
+The resulting 'final_ets_forecast' contains the forecasted values and allows me to project future trends and seasonality based on the characteristics learned from the historical data.
+
+#### [**Part 3 Comparison:**]{.underline}
+
+Now, that we have both the Arima and the Holt winters model setup, we need to assess the forecasting performance of both the ARIMA and Holt-Winters models for a two-week timeframe.
+
+To gain insights into the accuracy of each model's predictions, we initiated the examination by visualizing the forecasted values individually for ARIMA and Holt-Winters. This step allows us to observe the pattern and behavior of the forecasted series generated by each model.
+
+**A) Plot the forecasts of the ARIMA Model:**
+
+```{r}
+# Plot the forecast
+autoplot(final_forecast_20974) +
+  labs(title = "ARIMA Forecast for Total Lettuce Usage - Store 209741",
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+**B) Plot the forecasts of the Holt Winter Model:**
+
+```{r}
+# Plot the final forecast
+plot(final_ets_forecast, main = "Final Forecast from ETS on Entire Dataset", xlab="Time Horizon", ylab="Lettuce quantity (ounces)", lty = 1, col = "black", frame.plot = FALSE)
+```
+
+**C) ARIMA vs HoltWinters Model Forecasts:**
+
+```{r}
+# Plot actual data
+autoplot(store_series_ts) +
+  labs(title = "ARIMA  vs. HoltWinters Comparison",
+       x = "Date",
+       y = "Total Lettuce Usage") +
+  autolayer(final_forecast_20974$mean, series = "ARIMA Forecast") +
+  autolayer(final_ets_forecast$mean, series = "Holt-Winters Forecast") +
+  guides(color = guide_legend(title = "Forecasts"))
+```
+
+**Analysis of the Accuracies of both the Models:**
+
+Following the visual analysis of the ARIMA and Holt-Winters forecasts, we proceeded to a quantitative assessment using the Root Mean Squared Error (RMSE). RMSE is a widely utilized metric for evaluating the accuracy of forecasting models, providing a comprehensive measure of the differences between predicted and observed values. By calculating the RMSE for both the ARIMA and Holt-Winters models, we aim to quantify the level of accuracy each model achieves in capturing the actual values. A lower RMSE signifies better predictive performance, indicating that the model's forecasts closely align with the observed data. This numerical comparison aids in selecting the model that exhibits superior accuracy and reliability in forecasting the daily demand for lettuce in our dataset over the specified two-week period.
+
+```{r}
+#ARIMA Model
+accuracy(arima_forecast_20974.m1, validation_set_20974)
+#ETS ANA Model
+out_of_sample_errors_ets
+```
+
++--------------+--------------+--------------+
+| RMSE Values  | ARIMA        | HoltWinters  |
++==============+==============+==============+
+| Training Set | ```          | ```          |
+|              | 54.74107     | 49.80332     |
+|              | ```          | ```          |
++--------------+--------------+--------------+
+| Test set     | ```          | ```          |
+|              | 53.87050     | 50.26356     |
+|              | ```          | ```          |
++--------------+--------------+--------------+
+
+**Key Insights:**
+
+ETS model, the ANAModel, has lower RMSE values for both the training and test sets compared to the ARIMA model. This suggests that the ETS model provides a better fit to the data in terms of forecasting accuracy. The lower RMSE values indicate that the ETS model's predictions are closer to the actual values, both in the training and test phases.
+
+In summary, based on the RMSE values, the ETS model outperforms the ARIMA model in this specific analysis.
+
+**Final Forecasted Values:**
+
+Hence, the final predictions for the Store 20974 using the ETS - ANA model are:
+
+```{r}
+final_forecast_data_ets
+
+```
+
+## [Store: 4904]{.underline}
+
+In this analysis, we focused on a specific store, identified by the store number 4904. For our targeted store, we filtered the data to isolate lettuce-related transactions, creating a time series object to capture the daily total lettuce usage. The time series plot visualizes the fluctuations in lettuce consumption over time, providing insights into potential patterns or trends.
+
+This approach allows us to gain a deeper understanding of the store's lettuce demand dynamics, a crucial factor for making informed inventory replenishment decisions.
+
+```{r}
+# Choose store number
+store_number <- 4904
+
+# Filter data for the chosen store
+store_data_4904 <- total_lettuce_per_transaction %>% filter(StoreNumber == store_number)
+
+# Create a zoo object
+store_series <- zoo(store_data_4904$Total_Lettuce, as.Date(store_data_4904$date))
+
+# Create a time series object
+store_series_ts <- ts(store_data_4904$Total_Lettuce, frequency = 7)
+
+# Plot the time series
+autoplot(store_series_ts) +
+  labs(title = paste("Total Lettuce Usage for Store", store_number),
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+We zoomed in on Store 4904, carefully dividing its lettuce usage data into two parts -- an 80% chunk for training our forecasting models and a 20% slice to validate their accuracy. This split, respecting the chronological order of our data, sets the stage for effective model training and evaluation.
+
+```{r}
+# Split data for each store with window adjustment
+split_4904 <- split_data(store_series_ts, split_proportion)
+
+# Training Set (80%)
+training_set_4904_ts <- split_4904$train_data
+
+# Validation Set (20%)
+validation_set_4904 <- split_4904$test_data
+```
+
+#### [**Part 1) ARIMA Model:**]{.underline}
+
+I performed stationarity tests using the Augmented Dickey-Fuller (ADF), Phillips-Perron (PP), and Kwiatkowski-Phillips-Schmidt-Shin (KPSS) tests. Additionally, ndiffs and nsdiffs functions are used to determine the number of non-seasonal and seasonal differences needed to make the time series stationary, respectively.
+
+```{r}
+# ARIMA identification and order determination
+adf.test(training_set_4904_ts)
+pp.test(training_set_4904_ts)
+kpss.test(training_set_4904_ts)
+
+
+# seasonal differencing
+ndiffs(training_set_4904_ts)  
+nsdiffs(training_set_4904_ts)
+```
+
+**Key insights:**
+
+1.  Both the Augmented Dickey-Fuller Test and the Phillips-Perron Unit Root Test suggest stationarity with low p-values, indicating that the time series data for store 4904 is likely stationary.
+
+2.  The KPSS Test for Level Stationarity shows a p-value greater than 0.05, suggesting that there is evidence against the null hypothesis of non-stationarity.
+
+3.  ndiff is 0 and nsdiff is 1, this suggests that a first-order seasonal difference is needed to achieve stationarity in your time series data.
+
+    In other words, differencing the data once with respect to the seasonal component should be sufficient to make the series stationary. Hence, we carry out differencing and plot our resulted data:
+
+```{r}
+# ARIMA identification and order determination (continued)
+store_4904_ts_diff1 <- diff(training_set_4904_ts, differences = 1)
+autoplot(store_4904_ts_diff1)
+```
+
+**Key insight**: After differencing, data appears to be stationary now.
+
+Now we recheck the required results through the same tests again:
+
+```{r}
+# ARIMA identification and order determination
+adf.test(store_4904_ts_diff1)
+pp.test(store_4904_ts_diff1)
+kpss.test(store_4904_ts_diff1)
+
+
+# seasonal differencing
+ndiffs(store_4904_ts_diff1)  
+nsdiffs(store_4904_ts_diff1)
+```
+
+The differenced time series, obtained through seasonal differencing, exhibits strong evidence of stationarity based on Augmented Dickey-Fuller and Phillips-Perron tests, supporting its suitability for further modeling and forecasting.
+
+To further solidfy the selection of appropriate ARIMA parameters for our time series, we turn to the analysis of the autocorrelation function (ACF) and partial autocorrelation function (PACF). The visual examination of ACF and PACF plots aids in determining the optimal order for the ARIMA model, facilitating a more accurate and effective forecasting approach.
+
+**ACF Plot:**
+
+```{r}
+# Determine p and q
+ggAcf(store_4904_ts_diff1) +
+  labs(title = "ACF Plot for Total Lettuce Usage - Store 4904",
+       x = "Lag",
+       y = "Autocorrelation")
+```
+
+**PACF plot:**
+
+```{r}
+ggPacf(store_4904_ts_diff1) +
+  labs(title = "PACF Plot for Total Lettuce Usage - Store 4904",
+       x = "Lag",
+       y = "Partial Autocorrelation")
+```
+
+**Model Selection:**
+
+The auto.arima function was used to explore various combinations of differencing and seasonal parameters, considering the Akaike Information Criterion (AIC) as the selection criterion. Upon analysing the AIC values, three models with the lowest AICs were chosen. Subsequently, we proceeded to fit these selected models on our training data to further evaluate their forecasting capabilities.
+
+*(The code line for generating the auto arima models 'auto_arima_result_4904' is commented because of the long series of output. However, it stays uncommented in the RMD file)*
+
+```{r}
+# Automatic ARIMA model selection
+auto_arima_result_4904 <- auto.arima(training_set_4904_ts, ic = 'aicc', 
+stepwise = FALSE, approximation = FALSE, d=0, D = 1, trace = TRUE)
+
+auto_arima_result_4904
+
+#ARIMA(1,0,1)(0,1,1)[7]: 736.5686
+#ARIMA(1,0,3)(0,1,1)[7]: 737.3794
+#ARIMA(2,0,1)(0,1,1)[7]: 738.3387
+
+
+# Fit the ARIMA model
+arima_model_4904.m1 <- Arima(training_set_4904_ts, order = c(1, 0, 1), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+arima_model_4904.m2 <- Arima(training_set_4904_ts, order = c(1, 0, 3), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+arima_model_4904m3 <- Arima(training_set_4904_ts, order = c(2, 0, 1), 
+seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+```
+
+**Residuals analysis:**
+
+To make sure that the models we selected effectively represent the temporal trends, we used residual analysis. For residuals, R's checkresiduals() function offers an extensive collection of statistical tests and diagnostic charts. In order to confirm the accuracy of our projections and to make appropriate judgments, this phase is essential.
+
+```{r}
+# Residual analysis
+checkresiduals(arima_model_4904.m1)
+checkresiduals(arima_model_4904.m2)
+checkresiduals(arima_model_4904m3)
+```
+
+**Forecasting and Accuracy:**
+
+Considering the fitted ARIMA models, we produce forecasts for the validation set in this stage. The validation set is a certain fraction of our time series data that was not used for model training. The 'accuracy' function, which offers a comprehensive set of parameters to evaluate the model's performance against the real data, is then used to determine how accurate these forecasts are. This analysis helps determine which ARIMA model is most likely to accurately estimate lettuce demand at Store 4904.
+
+```{r}
+# Forecast using the fitted model
+arima_forecast_4904.m1 <- forecast(arima_model_4904.m1, h = length(validation_set_4904))
+arima_forecast_4904.m2 <- forecast(arima_model_4904.m2, h = length(validation_set_4904))
+arima_forecast_4904.m3 <- forecast(arima_model_4904m3, h = length(validation_set_4904))
+
+
+# Model evaluation
+accuracy(arima_forecast_4904.m1, validation_set_4904)
+accuracy(arima_forecast_4904.m2, validation_set_4904)
+accuracy(arima_forecast_4904.m3, validation_set_4904)
+#best rmse value is for arima_forecast_4904.m2 model
+```
+
+**Key Insights**:
+
+1.  With the lowest RMSE on the test sets, Model 2 performs better than the others according to the evaluation metrics, indicating that it is capable of forecasting lettuce demand at Store 4904 with greater accuracy.
+2.  Comparing this to models m1 and m3, a smaller RMSE demonstrates better performance in minimizing the prediction error.
+3.  The smaller RMSE values indicate that Model 2's forecasts align more closely with the actual values, making it the preferred choice for lettuce demand prediction in this context.
+
+**Fitting the best ARIMA Model on the entire data set:**
+
+The selected ARIMA(1,0,3)(0,1,1)[7] model, which has been determined to be the best-performing model on the training and validation sets, is being fitted to the whole dataset for Store 4904 in this stage of development. Establishing a definitive forecast for the subsequent 14 days is the ultimate objective.
+
+```{r}
+#now fit the first best model on our entire dataset
+arima_model_4904_final <- Arima(store_series_ts, order = c(1, 0, 3), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+
+# Final forecast
+final_forecast_4904 <- forecast(arima_model_4904_final, h = 14)
+
+# Extract point forecasts
+forecast_values_4904 <- final_forecast_4904$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_4904 <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_4904 <- data.frame(date = forecast_dates_4904, forecast = forecast_values_4904)
+
+# Print the final forecast data
+print(final_forecast_data_4904)
+
+```
+
+**Part 1 Conclusion**:
+
+In summary, the model has been validated on historical data, and its accuracy assessed through metrics such as RMSE. We built a forecast for the next 14 days using this ARIMA model, which offers insightful information for inventory management.
+
+#### [Part 2) Holt Winters Model:]{.underline}
+
+Moving forward, we will extend our analysis by investigating the Holt-Winters model in order to determine the best method of forecasting the demand for lettuce in our dataset.
+
+**Seasonal Decomposition:**
+
+Decomposing a time series facilitates the process of recognizing and illustrating the underlying patterns in the data, including the general trend and recurring seasonal patterns. Determining the total variability in the time series is made easier by having a clear understanding of each component's contribution
+
+```{r}
+plot(stl(store_series_ts, s.window = "period"), main="Seasonal Decomposition of Time Series: Store 4904", xaxt = "n")
+```
+
+**Key Insights:**
+
+1.  The trend is not linear here. It exhibits wavy patterns with fluctuations, rather than following a strict linear trajectory.
+2.  An additive seasonal component and an additive error seems to take place in the time-series and will be needed to the upcoming forecast model.
+
+**Model selection:**
+
+I performed ETS (Exponential Smoothing State Space) forecasting using the training set for Store 4904. First, I used the ets() function without specifying a model (store_4904_ets_training2) to identify the best ETS model for the given data. I got (A, A, A) model as the best model in this case. According to my analysis in the time series decomposition, the trend of the data seems to be non-linear. This indicates that the linearity is absent. Hence, I will choose to go ahead with the ANA Model for this case. and I used this model (store_4904_ets_training) on the training dataset for further analysis.
+
+```{r}
+# ETS forecast based on the training set
+store_4904_ets_training2 <- ets(training_set_4904_ts, model='ZZZ')
+
+# ETS MNM forecast based on the training set
+store_4904_ets_training <- ets(training_set_4904_ts, model='ANA', ic = 'aicc') 
+store_4904_ets_training
+```
+
+**In-sample estimation error:**
+
+Here we are evaluating the in-sample estimation error of the ETS (Error, Trend, Seasonal) model using the accuracy() function, which provides metrics like Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and others.
+
+```{r}
+# In-sample estimation error for ETS
+in_sample_errors_ets <- accuracy(store_4904_ets_training)
+in_sample_errors_ets
+
+```
+
+In conclusion, these metrics provide insights into the performance of the ETS model on the training data.
+
+**Out-of-sample evaluation:**
+
+I am using the trained ETS model (store_4904_ets_training) to generate forecasts for the length of the validation set. Furthermore, I evaluate the accuracy of the ETS model's forecasts against the actual values in the validation set. This helps in understanding how well the ETS model performs on unseen data by comparing its forecasts with the actual values in the validation set, using a range of accuracy metrics.
+
+```{r}
+#Out-of-sample evaluation for ETS
+store_4904_ets_forecast <- forecast.ets(store_4904_ets_training, h = length(validation_set_4904))
+
+# Forecasting erros - ETS MODEL
+out_of_sample_errors_ets <- accuracy(store_4904_ets_forecast, validation_set_4904)
+out_of_sample_errors_ets
+```
+
+**Building the ANA model on the entire data set:**
+
+The trained model is now employed to forecast the future values for the entire time series (store_series_ts). The model is trained on the entire dataset, and then we generate a forecast for the next 14 time points (h = 14).
+
+```{r}
+# ETS MNM forecast on the entire dataset
+final_ets_model <- ets(store_series_ts, model ='ANA', ic = 'aicc') 
+final_ets_forecast <- forecast.ets(final_ets_model, h = 14)
+
+# Extract point forecasts
+forecast_values_ets <- final_ets_forecast$mean
+
+# Create forecast dates from 16/06/2015 to 29/06/2015
+forecast_dates_ets <- seq(as.Date("2015-06-16"), by = "days", length.out = 14)
+
+# Create a data frame with dates and point forecasts
+final_forecast_data_ets <- data.frame(date = forecast_dates_ets, forecast = forecast_values_ets)
+
+# Print the final forecast data
+print(final_forecast_data_ets)
+```
+
+**Part 2 Conclusion:**
+
+The resulting 'final_ets_forecast' contains the forecasted values and allows me to project future trends and seasonality based on the characteristics learned from the historical data.
+
+#### [**Part 3 Comparison:**]{.underline}
+
+Now, that we have both the Arima and the Holt winters model setup, we need to assess the forecasting performance of both the ARIMA and Holt-Winters models for a two-week timeframe.
+
+To gain insights into the accuracy of each model's predictions, we initiated the examination by visualizing the forecasted values individually for ARIMA and Holt-Winters. This step allows us to observe the pattern and behavior of the forecasted series generated by each model.
+
+**A) Plot the forecasts of the ARIMA Model:**
+
+```{r}
+# Plot the forecast
+autoplot(final_forecast_4904) +
+  labs(title = "ARIMA Forecast for Total Lettuce Usage - Store 4904",
+       x = "Date",
+       y = "Total Lettuce Usage")
+```
+
+**B) Plot the forecasts of the Holt Winter Model:**
+
+```{r}
+# Plot the final forecast
+plot(final_ets_forecast, main = "Final Forecast from ETS on Entire Dataset", xlab="Time Horizon", ylab="Lettuce quantity (ounces)", lty = 1, col = "black", frame.plot = FALSE)
+```
+
+**C) ARIMA vs HoltWinters Model Forecasts:**
+
+```{r}
+# Plot actual data
+autoplot(store_series_ts) +
+  labs(title = "Actual vs. Forecast Comparison",
+       x = "Date",
+       y = "Total Lettuce Usage") +
+  autolayer(final_forecast_4904$mean, series = "ARIMA Forecast") +
+  autolayer(final_ets_forecast$mean, series = "Holt-Winters Forecast") +
+  guides(color = guide_legend(title = "Forecasts"))
+```
+
+**Analysis of the Accuracies of both the Models:**
+
+Following the visual analysis of the ARIMA and Holt-Winters forecasts, we proceeded to a quantitative assessment using the Root Mean Squared Error (RMSE). RMSE is a widely utilized metric for evaluating the accuracy of forecasting models, providing a comprehensive measure of the differences between predicted and observed values. By calculating the RMSE for both the ARIMA and Holt-Winters models, we aim to quantify the level of accuracy each model achieves in capturing the actual values. A lower RMSE signifies better predictive performance, indicating that the model's forecasts closely align with the observed data. This numerical comparison aids in selecting the model that exhibits superior accuracy and reliability in forecasting the daily demand for lettuce in our dataset over the specified two-week period.
+
+```{r}
+#ARIMA model
+accuracy(arima_forecast_4904.m2, validation_set_4904)
+#ets ana model
+out_of_sample_errors_ets
+```
+
++-------------+--------------+--------------+
+| RMSE Values | ARIMA        | Holt winters |
++=============+==============+==============+
+| Train data  | ```          | ```          |
+|             | 42.08627     | 41.26204     |
+|             | ```          | ```          |
++-------------+--------------+--------------+
+| test data   | ```          | ```          |
+|             | 58.81662     | 55.95950     |
+|             | ```          | ```          |
++-------------+--------------+--------------+
+
+**Key Insights:**
+
+ETS model, the ANA Model, has lower RMSE values for both the training and test sets compared to the ARIMA model. This suggests that the ETS model provides a better fit to the data in terms of forecasting accuracy. The lower RMSE values indicate that the ETS model's predictions are closer to the actual values, both in the training and test phases.
+
+In summary, based on the RMSE values, the ETS model outperforms the ARIMA model in this specific analysis.
+
+**Final Forecasted Values:**
+
+Hence, the final predictions for the Store 4904 using the ETS - ANA model are:
+
+```{r}
+# Print the final forecast data
+print(final_forecast_data_ets)
+
+```
